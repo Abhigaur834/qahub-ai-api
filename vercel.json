@@ -1,1 +1,12 @@
-
+{
+  "version": 2,
+  "functions": {
+    "api/webhook.js":    { "maxDuration": 30 },
+    "api/upload.js":     { "maxDuration": 30 },
+    "api/transcribe.js": { "maxDuration": 300 },
+    "api/ai-score.js":   { "maxDuration": 120 }
+  },
+  "routes": [
+    { "src": "/api/(.*)", "dest": "/api/$1" }
+  ]
+}
