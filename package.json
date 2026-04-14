@@ -1,1 +1,13 @@
-
+{
+  "name": "qahub-ai-api",
+  "version": "1.0.0",
+  "description": "QA.Hub AI Audit Pipeline — Vercel Serverless",
+  "main": "index.js",
+  "dependencies": {
+    "firebase-admin": "^11.11.0",
+    "node-fetch": "^2.7.0"
+  },
+  "engines": {
+    "node": "18.x"
+  }
+}
