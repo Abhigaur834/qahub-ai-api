@@ -1,5 +1,8 @@
 /**
- * QA.Hub — AI Scoring via Claude
+ * QA.Hub — AI Scoring via Google Gemini Flash (FREE)
+ * Free tier: 15 RPM, 1 million tokens/day — no credit card needed.
+ * Get your free key at: https://aistudio.google.com/app/apikey
+ *
  * Scores a transcript against the 22-parameter QA scorecard.
  * Output maps directly to the dashboard's CS object format.
  */
@@ -20,7 +23,7 @@ function getDb() {
   return admin.database();
 }
 
-// ── Scoring weights (mirrors dashboard PM object) ────────────────────────────
+// ── Scoring weights (mirrors dashboard PM object) ─────────────────────────
 const NC_POINTS = {
   nc1: 10, nc2: 10, nc3: 5,  nc4: 10,
   nc5: 10, nc6: 10, nc7: 10,
@@ -48,19 +51,19 @@ function calcScores(scores) {
   return { ncPct, earned, total, fatal, totPct, result };
 }
 
-const SCORECARD_PROMPT = `You are an expert BPO Quality Analyst. Analyse the call transcript below and score each parameter.
+const SCORECARD_PROMPT = `You are an expert BPO Quality Analyst. Analyse the call transcript and score each of the 22 parameters below.
 
 SCORING RULES:
-- NC (Non-Critical) parameters: score Y (yes), N (no), or NA (not applicable)
-- CR (Critical) parameters: score Y or N only — any N = automatic FATAL FAIL
-- NA means the parameter was genuinely not applicable to this call
+- NC (Non-Critical): score "yes", "no", or "na" (not applicable)
+- CR (Critical): score "yes" or "no" ONLY — any "no" = FATAL FAIL
+- "na" = parameter genuinely not applicable to this call
 
 NON-CRITICAL PARAMETERS (point-weighted):
 nc1  (10pts) Standard opening & customer name confirmation
 nc2  (10pts) Summarization — agent summarised the issue
 nc3  (5pts)  Further assistance offered before closing
 nc4  (10pts) Prescribed call closing used
-nc5  (10pts) Paraphrasing — agent repeated back to confirm understanding
+nc5  (10pts) Paraphrasing — repeated back to confirm understanding
 nc6  (10pts) Customer VOC understood and acknowledged
 nc7  (10pts) Relevant probing questions asked
 nc8  (10pts) Active Listening / Reading demonstrated
@@ -69,7 +72,7 @@ nc10 (5pts)  Apologies, Empathy, and Politeness demonstrated
 nc11 (10pts) Conversation without overlapping or interruptions
 nc12 (5pts)  Accurate email sent to client (if applicable)
 
-CRITICAL PARAMETERS (any N = FATAL FAIL — score 0%):
+CRITICAL PARAMETERS (any "no" = FATAL FAIL — score becomes 0%):
 cr1  Agent remained professional, polite, and pleasant throughout
 cr2  Called client within timeframe & accommodated callback per global timezone
 cr3  Provided complete and accurate information
@@ -81,7 +84,8 @@ cr8  Directed non-sales queries to relevant team
 cr9  All client questions answered accurately
 cr10 Converted lead without pushing (no pressure tactics)
 
-Respond ONLY with valid JSON in this exact format — no markdown, no explanation:
+IMPORTANT: Return ONLY valid JSON with no markdown, no explanation, no extra text.
+Use exactly this structure:
 {
   "scores": {
     "nc1":"yes","nc2":"yes","nc3":"na","nc4":"yes","nc5":"yes",
@@ -91,14 +95,13 @@ Respond ONLY with valid JSON in this exact format — no markdown, no explanatio
     "cr6":"yes","cr7":"na","cr8":"na","cr9":"yes","cr10":"yes"
   },
   "reasons": {
-    "nc7": "Agent did not ask any probing questions about the client's budget",
-    "cr3": "Agent provided correct pricing information"
+    "nc7": "Agent did not ask any probing questions about the client's budget"
   },
-  "callSummary": "2-3 sentence summary of what happened on this call",
+  "callSummary": "2-3 sentence summary of the call",
   "agentStrengths": "One sentence about what the agent did well",
   "coachingTips": [
-    "Specific actionable coaching tip 1",
-    "Specific actionable coaching tip 2"
+    "Specific actionable tip 1",
+    "Specific actionable tip 2"
   ],
   "confidence": 0.85
 }`;
@@ -120,62 +123,70 @@ module.exports = async (req, res) => {
   try {
     await callRef.update({ status: 'ai_scoring' });
 
-    // ── Call Claude API ──────────────────────────────────────────────────────
-    const claudeRes = await fetch('https://api.anthropic.com/v1/messages', {
-      method: 'POST',
-      headers: {
-        'Content-Type':      'application/json',
-        'x-api-key':         process.env.ANTHROPIC_API_KEY,
-        'anthropic-version': '2023-06-01',
-      },
-      body: JSON.stringify({
-        model:      'claude-sonnet-4-20250514',
-        max_tokens: 1500,
-        system:     SCORECARD_PROMPT,
-        messages: [{
-          role:    'user',
-          content: `Score this call transcript:\n\n${transcript}`,
-        }],
-      }),
-    });
+    // ── Call Google Gemini Flash (FREE) ─────────────────────────────────────
+    const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
+    if (!GEMINI_API_KEY) throw new Error('GEMINI_API_KEY environment variable not set');
 
-    if (!claudeRes.ok) {
-      throw new Error(`Claude API ${claudeRes.status}: ${await claudeRes.text()}`);
+    const geminiRes = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${GEMINI_API_KEY}`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          contents: [{
+            parts: [{
+              text: SCORECARD_PROMPT + '\n\nCALL TRANSCRIPT:\n' + transcript
+            }]
+          }],
+          generationConfig: {
+            temperature:     0.1,
+            maxOutputTokens: 1500,
+          },
+        }),
+      }
+    );
+
+    if (!geminiRes.ok) {
+      const errText = await geminiRes.text();
+      throw new Error(`Gemini API ${geminiRes.status}: ${errText}`);
     }
 
-    const claudeData = await claudeRes.json();
-    const rawText    = claudeData.content?.[0]?.text || '';
+    const geminiData = await geminiRes.json();
+    const rawText    = geminiData.candidates?.[0]?.content?.parts?.[0]?.text || '';
 
-    // ── Parse JSON response ──────────────────────────────────────────────────
+    if (!rawText) throw new Error('Gemini returned empty response');
+
+    // ── Parse JSON response ────────────────────────────────────────────────
     let parsed;
     try {
+      // Strip any markdown code fences Gemini might add
       const clean = rawText.replace(/```json\n?/g, '').replace(/```/g, '').trim();
       parsed = JSON.parse(clean);
     } catch (e) {
-      // Try extracting JSON from response if Claude added text around it
+      // Try extracting JSON if there's text around it
       const match = rawText.match(/\{[\s\S]*\}/);
       if (match) {
         parsed = JSON.parse(match[0]);
       } else {
-        throw new Error('Claude returned invalid JSON: ' + rawText.slice(0, 200));
+        throw new Error('Gemini returned invalid JSON: ' + rawText.slice(0, 300));
       }
     }
 
-    // ── Calculate scores ─────────────────────────────────────────────────────
+    // ── Calculate scores ──────────────────────────────────────────────────
     const { ncPct, earned, total, fatal, totPct, result } = calcScores(parsed.scores || {});
 
     const aiSuggestions = {
-      scores:        parsed.scores        || {},
-      reasons:       parsed.reasons       || {},
-      callSummary:   parsed.callSummary   || '',
-      agentStrengths:parsed.agentStrengths|| '',
-      coachingTips:  parsed.coachingTips  || [],
-      confidence:    parsed.confidence    || 0.8,
-      ncScore:       ncPct,
-      ncEarned:      earned,
-      ncTotal:       total,
-      crFatal:       fatal,
-      totalScore:    totPct,
+      scores:         parsed.scores         || {},
+      reasons:        parsed.reasons        || {},
+      callSummary:    parsed.callSummary    || '',
+      agentStrengths: parsed.agentStrengths || '',
+      coachingTips:   parsed.coachingTips   || [],
+      confidence:     parsed.confidence     || 0.8,
+      ncScore:        ncPct,
+      ncEarned:       earned,
+      ncTotal:        total,
+      crFatal:        fatal,
+      totalScore:     totPct,
       result,
     };
 
