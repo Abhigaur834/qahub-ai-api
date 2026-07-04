@@ -16,6 +16,15 @@ function getDb() {
 
 module.exports = async (req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+  res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
+
+  // ★ FIX: browsers send an OPTIONS "preflight" request before the real POST
+  // whenever the request has a JSON body (cross-origin). This endpoint was
+  // rejecting that preflight with 405, which made the browser block every
+  // real upload before it was ever sent — this is what "Failed to fetch" /
+  // "Imported 0, N failed" actually was.
+  if (req.method === 'OPTIONS') return res.status(200).end();
 
   if (req.method !== 'POST') {
     return res.status(405).json({ error: 'Method not allowed' });
