@@ -72,6 +72,25 @@ module.exports = async (req, res) => {
       createdAt: new Date().toISOString(),
     });
 
+    // ★ FIX: this call was previously never made — the record sat at
+    // "pending_transcription" forever because nothing told the transcription
+    // pipeline it existed. webhook.js already did this correctly; upload.js
+    // (used by both manual upload and Smartflo Sync) was missing it entirely.
+    const apiBase = process.env.API_BASE_URL || `https://${process.env.VERCEL_URL}`;
+    fetch(`${apiBase}/api/transcribe`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-internal-key': process.env.INTERNAL_API_KEY,
+      },
+      body: JSON.stringify({
+        callKey: callRef.key,
+        processId,
+        recordingUrl,
+        language: language || 'hi-en',
+      }),
+    }).catch(e => console.error('Transcribe trigger failed:', e));
+
     return res.json({ success: true, callKey: callRef.key, processId });
 
   } catch (err) {
