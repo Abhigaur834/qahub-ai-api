@@ -125,15 +125,25 @@ module.exports = async (req, res) => {
     });
 
     // ── Trigger AI scoring ───────────────────────────────────────────────────
-    const apiBase = process.env.API_BASE_URL || `https://${process.env.VERCEL_URL}`;
-    fetch(`${apiBase}/api/ai-score`, {
-      method:  'POST',
-      headers: {
-        'Content-Type':   'application/json',
-        'x-internal-key': process.env.INTERNAL_API_KEY,
-      },
-      body: JSON.stringify({ callKey, processId, transcript: fullTranscript, segments }),
-    }).catch(e => console.error('AI score trigger failed:', e));
+    // ★ FIX: this MUST be awaited, not fire-and-forget. Vercel can terminate
+    // this function's execution the instant it returns its response — an
+    // un-awaited fetch() left running in the background can get killed
+    // before the request to /api/ai-score is ever actually delivered. That
+    // silently stranded every call at status "ai_scoring" forever, exactly
+    // like the same bug did for the upload → transcribe handoff.
+    try {
+      const apiBase = process.env.API_BASE_URL || `https://${process.env.VERCEL_URL}`;
+      await fetch(`${apiBase}/api/ai-score`, {
+        method:  'POST',
+        headers: {
+          'Content-Type':   'application/json',
+          'x-internal-key': process.env.INTERNAL_API_KEY,
+        },
+        body: JSON.stringify({ callKey, processId, transcript: fullTranscript, segments }),
+      });
+    } catch (e) {
+      console.error('AI score trigger failed:', e);
+    }
 
     return res.status(200).json({
       success:   true,
