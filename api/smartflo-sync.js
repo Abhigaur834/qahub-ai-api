@@ -92,8 +92,6 @@ module.exports = async (req, res) => {
     const {
       fromDate,   // optional, "YYYY-MM-DD" — defaults to today
       toDate,     // optional, "YYYY-MM-DD" — defaults to today
-      page = '1',
-      limit = '50',
       agentName,  // optional filter, matches agent_name (case-insensitive contains)
       callType,   // 'connected' | 'not_connected' | 'all' — defaults to 'connected'
     } = req.body || {};
@@ -105,50 +103,63 @@ module.exports = async (req, res) => {
     const from = fromDate ? new Date(fromDate + ' 00:00:00') : startOfToday;
     const to   = toDate   ? new Date(toDate   + ' 23:59:59') : endOfToday;
 
-    // ── Fetch from Smartflo ─────────────────────────────────────────────
+    // ── Fetch from Smartflo — paginate across the WHOLE date range ────────
+    // ★ FIX: previously this only ever looked at the first 100 records
+    // (page=1), then filtered by agent within just that slice — so an
+    // agent's calls sitting anywhere else in a busy day were invisible.
+    // Now we page through until either the whole range is covered or we've
+    // collected a healthy number of matches, whichever comes first.
     const token = await getSmartfloToken();
-
     const mode = ['connected', 'not_connected', 'all'].includes(callType) ? callType : 'connected';
+    const PAGE_SIZE = 100;
+    const MAX_PAGES = 30;   // safety cap: up to 3,000 raw records scanned per request
+    const MAX_MATCHES = 300; // stop early once we have plenty to show
 
-    const qsParams = {
-      from_date: formatSmartfloDate(from),
-      to_date:   formatSmartfloDate(to),
-      page:      String(page),
-      limit:     String(limit),
-    };
-    // Ask Smartflo to pre-filter where possible; 'all' omits the filter entirely
-    if (mode === 'connected') qsParams.call_type = 'c';
-    if (mode === 'not_connected') qsParams.call_type = 'm';
-    const qs = new URLSearchParams(qsParams);
-
-    const cdrRes = await fetch(`https://api-smartflo.tatateleservices.com/v1/call/records?${qs.toString()}`, {
-      method: 'GET',
-      headers: { 'Authorization': `Bearer ${token}`, 'Accept': 'application/json' },
-    });
-
-    if (!cdrRes.ok) {
-      const errText = await cdrRes.text();
-      throw new Error(`Smartflo call records fetch failed (${cdrRes.status}): ${errText}`);
+    function buildQs(pageNum) {
+      const p = { from_date: formatSmartfloDate(from), to_date: formatSmartfloDate(to), page: String(pageNum), limit: String(PAGE_SIZE) };
+      if (mode === 'connected') p.call_type = 'c';
+      if (mode === 'not_connected') p.call_type = 'm';
+      return new URLSearchParams(p);
     }
 
-    const cdrData = await cdrRes.json();
-    let results = Array.isArray(cdrData.results) ? cdrData.results : [];
-
-    // ★ Only require a real recording for "connected" — not-connected calls
-    // never have one, and "all" should show both kinds.
-    results = results.filter(r => {
+    function passesFilter(r) {
       const isConnected = !!(r.recording_url && Number(r.call_duration) > 0);
-      if (mode === 'connected') return isConnected;
-      if (mode === 'not_connected') return !isConnected;
-      return true; // 'all'
-    });
-
-    if (agentName) {
-      const needle = agentName.toLowerCase();
-      results = results.filter(r => (r.agent_name || '').toLowerCase().includes(needle));
+      const connectedOk = mode === 'connected' ? isConnected : mode === 'not_connected' ? !isConnected : true;
+      if (!connectedOk) return false;
+      if (agentName) return (r.agent_name || '').toLowerCase().includes(agentName.toLowerCase());
+      return true;
     }
 
-    const calls = results.map(r => ({
+    let matches = [];
+    let totalAvailable = 0;
+    let pagesFetched = 0;
+
+    for (let p = 1; p <= MAX_PAGES; p++) {
+      const cdrRes = await fetch(`https://api-smartflo.tatateleservices.com/v1/call/records?${buildQs(p).toString()}`, {
+        method: 'GET',
+        headers: { 'Authorization': `Bearer ${token}`, 'Accept': 'application/json' },
+      });
+      if (!cdrRes.ok) {
+        const errText = await cdrRes.text();
+        throw new Error(`Smartflo call records fetch failed (${cdrRes.status}): ${errText}`);
+      }
+      const cdrData = await cdrRes.json();
+      pagesFetched++;
+      if (p === 1) totalAvailable = cdrData.count || 0;
+
+      const pageResults = Array.isArray(cdrData.results) ? cdrData.results : [];
+      if (!pageResults.length) break; // no more data
+
+      matches.push(...pageResults.filter(passesFilter));
+
+      const recordsSeenSoFar = p * PAGE_SIZE;
+      if (matches.length >= MAX_MATCHES) break;        // enough matches, stop early
+      if (recordsSeenSoFar >= totalAvailable) break;    // covered the whole range
+    }
+
+    matches = matches.slice(0, MAX_MATCHES);
+
+    const calls = matches.map(r => ({
       callId:        r.call_id,
       agentName:     r.agent_name || null,
       callerNumber:  r.client_number || r.caller_id_num || null,
@@ -164,8 +175,8 @@ module.exports = async (req, res) => {
     return res.status(200).json({
       success: true,
       count: calls.length,
-      totalAvailable: cdrData.count || calls.length,
-      page: cdrData.page || 1,
+      totalAvailable,
+      pagesFetched,
       calls,
     });
 
@@ -174,3 +185,7 @@ module.exports = async (req, res) => {
     return res.status(500).json({ error: error.message });
   }
 };
+
+// ★ The pagination loop above can make up to 30 sequential requests to
+// Smartflo when searching a busy day — raise the timeout accordingly.
+module.exports.config = { maxDuration: 60 };
