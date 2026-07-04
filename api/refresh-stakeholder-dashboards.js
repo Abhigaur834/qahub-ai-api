@@ -222,8 +222,18 @@ async function buildSnapshotForProcess(db, processId) {
 }
 
 module.exports = async (req, res) => {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
+  if (req.method === 'OPTIONS') return res.status(200).end();
+
+  // Vercel's own Cron scheduler sends `Authorization: Bearer <CRON_SECRET>`.
+  // For manual/browser testing, a `?secret=` query param is also accepted —
+  // just visit the URL directly with your secret appended.
   const authHeader = req.headers['authorization'] || '';
-  if (authHeader !== `Bearer ${process.env.CRON_SECRET}`) {
+  const bearerOk = authHeader === `Bearer ${process.env.CRON_SECRET}`;
+  const queryOk = req.query && req.query.secret === process.env.CRON_SECRET;
+  if (!bearerOk && !queryOk) {
     return res.status(401).json({ error: 'Unauthorized' });
   }
 
