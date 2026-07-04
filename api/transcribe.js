@@ -162,3 +162,8 @@ module.exports = async (req, res) => {
     return res.status(500).json({ error: error.message });
   }
 };
+
+// ★ FIX: this function now awaits the full ai-score call before returning
+// (see above), on top of its own Deepgram transcription time. Raise the
+// timeout to the Hobby-plan maximum of 60s so both fit comfortably.
+module.exports.config = { maxDuration: 60 };
