@@ -1,9 +1,17 @@
 {
   "version": 2,
   "functions": {
-    "api/webhook.js":    { "maxDuration": 30  },
-    "api/transcribe.js": { "maxDuration": 120 },
-    "api/ai-score.js":   { "maxDuration": 120 },
-    "api/upload.js":     { "maxDuration": 30  }
-  }
+    "api/webhook.js":     { "maxDuration": 30  },
+    "api/transcribe.js":  { "maxDuration": 120 },
+    "api/ai-score.js":    { "maxDuration": 120 },
+    "api/upload.js":      { "maxDuration": 30  },
+    "api/smartflo-sync.js": { "maxDuration": 60 },
+    "api/refresh-stakeholder-dashboards.js": { "maxDuration": 60 }
+  },
+  "crons": [
+    {
+      "path": "/api/refresh-stakeholder-dashboards",
+      "schedule": "30 18 * * *"
+    }
+  ]
 }
