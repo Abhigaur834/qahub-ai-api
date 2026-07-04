@@ -195,17 +195,62 @@ async function buildSnapshotForProcess(db, processId) {
     };
   });
 
-  // Coaching impact — aggregate only
+  // Score distribution — how spread out are audit scores, not just the average
+  const distBuckets = new Array(10).fill(0);
+  v.forEach(a => { const b = Math.min(Math.floor(a.totalScore / 10), 9); distBuckets[b]++; });
+  const scoreDistribution = distBuckets.map((count, i) => ({ label: `${i * 10}-${i * 10 + 9}%`, count }));
+
+  // Fatal failures by month — separate trend line, not just a single total
+  const fatalMonMap = {};
+  audits.forEach(a => {
+    const ds = a.date || a.callDate;
+    if (!ds) return;
+    const k = ds.slice(0, 7);
+    fatalMonMap[k] = fatalMonMap[k] || 0;
+    if (a.crFatal) fatalMonMap[k]++;
+  });
+  const fatalTrend = Object.keys(fatalMonMap).sort().slice(-6).map(k => {
+    const [y, m] = k.split('-');
+    return { label: new Date(+y, +m - 1, 1).toLocaleDateString('en-GB', { month: 'short', year: '2-digit' }), count: fatalMonMap[k] };
+  });
+
+  // Period-over-period deltas — last 30 days vs the 30 days before that
+  const now = Date.now();
+  const last30 = audits.filter(a => a.totalScore != null && a.timestamp && (now - a.timestamp) <= 30 * 86400000);
+  const prev30 = audits.filter(a => a.totalScore != null && a.timestamp && (now - a.timestamp) > 30 * 86400000 && (now - a.timestamp) <= 60 * 86400000);
+  const last30Avg = last30.length ? Math.round(last30.reduce((s, a) => s + a.totalScore, 0) / last30.length) : null;
+  const prev30Avg = prev30.length ? Math.round(prev30.reduce((s, a) => s + a.totalScore, 0) / prev30.length) : null;
+  const last30PassRate = last30.length ? Math.round(last30.filter(a => a.result === 'Pass').length / last30.length * 100) : null;
+  const prev30PassRate = prev30.length ? Math.round(prev30.filter(a => a.result === 'Pass').length / prev30.length * 100) : null;
+
+  // At-risk agents — same early-warning logic as the internal dashboard's Dip Alerts,
+  // surfaced here so stakeholders can see quality issues are being proactively caught
+  const riskAlerts = [];
+  Object.entries(agentMap).forEach(([agentName, ag]) => {
+    const sorted = [...ag.evals].filter(a => a.totalScore != null).sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
+    if (sorted.length >= 3 && sorted.slice(0, 3).every(a => a.totalScore < 70)) {
+      riskAlerts.push({ agent: agentName, reason: '3 consecutive scores below 70%' });
+    }
+    const sevenDaysAgo = now - 7 * 86400000;
+    const recentFatal = ag.evals.filter(a => a.crFatal && a.timestamp && a.timestamp > sevenDaysAgo);
+    if (recentFatal.length >= 2) {
+      riskAlerts.push({ agent: agentName, reason: '2+ fatal failures in the last 7 days' });
+    }
+  });
+
+  // Coaching impact — per-agent before/after averages only, never session notes
+  const coachingDetail = [];
   let improvementSum = 0, improvementCount = 0;
   for (const s of coaching) {
     const d = new Date(s.date || s.timestamp);
     const before = audits.filter(a => a.agent === s.agent && new Date(a.date || a.callDate) < d && new Date(a.date || a.callDate) > new Date(d.getTime() - 30 * 86400000) && a.totalScore != null);
     const after = audits.filter(a => a.agent === s.agent && new Date(a.date || a.callDate) >= d && new Date(a.date || a.callDate) < new Date(d.getTime() + 30 * 86400000) && a.totalScore != null);
     if (before.length && after.length) {
-      const bAvg = before.reduce((s, a) => s + a.totalScore, 0) / before.length;
-      const aAvg = after.reduce((s, a) => s + a.totalScore, 0) / after.length;
+      const bAvg = Math.round(before.reduce((s, a) => s + a.totalScore, 0) / before.length);
+      const aAvg = Math.round(after.reduce((s, a) => s + a.totalScore, 0) / after.length);
       improvementSum += (aAvg - bAvg);
       improvementCount++;
+      coachingDetail.push({ agent: s.agent, beforeAvg: bAvg, afterAvg: aAvg, delta: aAvg - bAvg });
     }
   }
 
@@ -213,11 +258,19 @@ async function buildSnapshotForProcess(db, processId) {
     processId,
     generatedAt: new Date().toISOString(),
     generatedBy: 'auto-scheduled',
-    kpis: { avgScore, passRate, totalAudits: audits.length, fatalCount, fatalRate },
-    monthlyTrend, weeklyTrend, volumeByMonth,
+    kpis: {
+      avgScore, passRate, totalAudits: audits.length, fatalCount, fatalRate,
+      scoreDelta: (last30Avg != null && prev30Avg != null) ? last30Avg - prev30Avg : null,
+      passRateDelta: (last30PassRate != null && prev30PassRate != null) ? last30PassRate - prev30PassRate : null,
+    },
+    monthlyTrend, weeklyTrend, volumeByMonth, fatalTrend, scoreDistribution,
     paretoTop, ncCrSplit: { nc: ncFails, cr: crFails },
-    leaderboard, teamComparison,
-    coaching: { sessionsLogged: coaching.length, avgImprovement: improvementCount ? Math.round((improvementSum / improvementCount) * 10) / 10 : null },
+    leaderboard, teamComparison, riskAlerts: riskAlerts.slice(0, 20),
+    coaching: {
+      sessionsLogged: coaching.length,
+      avgImprovement: improvementCount ? Math.round((improvementSum / improvementCount) * 10) / 10 : null,
+      detail: coachingDetail.slice(0, 20),
+    },
   };
 }
 
