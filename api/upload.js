@@ -109,3 +109,8 @@ module.exports = async (req, res) => {
     return res.status(500).json({ error: err.message });
   }
 };
+
+// ★ FIX: this function now awaits the full transcribe→score chain (see above),
+// which can easily exceed Vercel's 10s default timeout. Raise it to the
+// Hobby-plan maximum of 60s.
+module.exports.config = { maxDuration: 60 };
