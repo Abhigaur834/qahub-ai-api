@@ -1,5 +1,4 @@
 const admin = require('firebase-admin');
-
 function getDb() {
   if (!admin.apps.length) {
     admin.initializeApp({
@@ -13,7 +12,6 @@ function getDb() {
   }
   return admin.database();
 }
-
 function normalizePayload(body, query) {
   const processId = query.orgId || query.processId || body.orgId || 'LQ';
   if (body.CallSid || body.CallTo) {
@@ -33,7 +31,6 @@ function normalizePayload(body, query) {
     recordingUrl:body.recordingUrl||body.recording_url||body.recording,
     duration:parseInt(body.duration||0), status:body.status||'completed' };
 }
-
 module.exports = async (req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
@@ -51,12 +48,20 @@ module.exports = async (req, res) => {
       finalAuditId:null, assignedTo:null, language:'hi-en',
       createdAt:new Date().toISOString(),
     });
+    // ★ FIX: awaited instead of fire-and-forget — see transcribe.js and
+    // upload.js for the full explanation. Vercel can kill an un-awaited
+    // background fetch() before it's actually sent once this function
+    // returns its response, silently stranding the call.
     const apiBase = process.env.API_BASE_URL || `https://${process.env.VERCEL_URL}`;
-    fetch(`${apiBase}/api/transcribe`, {
-      method:'POST',
-      headers:{ 'Content-Type':'application/json', 'x-internal-key':process.env.INTERNAL_API_KEY },
-      body:JSON.stringify({ callKey:callRef.key, processId:payload.processId, recordingUrl:payload.recordingUrl, language:'hi-en' }),
-    }).catch(console.error);
+    try {
+      await fetch(`${apiBase}/api/transcribe`, {
+        method:'POST',
+        headers:{ 'Content-Type':'application/json', 'x-internal-key':process.env.INTERNAL_API_KEY },
+        body:JSON.stringify({ callKey:callRef.key, processId:payload.processId, recordingUrl:payload.recordingUrl, language:'hi-en' }),
+      });
+    } catch (e) {
+      console.error('Transcribe trigger failed:', e);
+    }
     return res.status(200).json({ ok:true, callKey:callRef.key });
   } catch (error) {
     console.error('Webhook error:', error);
