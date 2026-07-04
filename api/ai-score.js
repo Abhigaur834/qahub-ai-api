@@ -258,3 +258,6 @@ module.exports = async (req, res) => {
     return res.status(500).json({ error: error.message });
   }
 };
+
+// ★ Extra headroom for the Gemini call — cheap insurance against slow responses.
+module.exports.config = { maxDuration: 60 };
