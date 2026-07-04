@@ -76,20 +76,31 @@ module.exports = async (req, res) => {
     // "pending_transcription" forever because nothing told the transcription
     // pipeline it existed. webhook.js already did this correctly; upload.js
     // (used by both manual upload and Smartflo Sync) was missing it entirely.
+    // ★ FIX #2: this MUST be awaited. Vercel can terminate a function's
+    // execution the instant it sends its response — a "fire and forget"
+    // fetch() left running in the background can get killed mid-flight
+    // before the request is even delivered. Awaiting it guarantees the
+    // trigger actually happens, at the cost of upload() taking a few
+    // seconds longer to respond (acceptable — the dashboard already shows
+    // "AI is scoring, check back in ~60s" after this call returns).
     const apiBase = process.env.API_BASE_URL || `https://${process.env.VERCEL_URL}`;
-    fetch(`${apiBase}/api/transcribe`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'x-internal-key': process.env.INTERNAL_API_KEY,
-      },
-      body: JSON.stringify({
-        callKey: callRef.key,
-        processId,
-        recordingUrl,
-        language: language || 'hi-en',
-      }),
-    }).catch(e => console.error('Transcribe trigger failed:', e));
+    try {
+      await fetch(`${apiBase}/api/transcribe`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-internal-key': process.env.INTERNAL_API_KEY,
+        },
+        body: JSON.stringify({
+          callKey: callRef.key,
+          processId,
+          recordingUrl,
+          language: language || 'hi-en',
+        }),
+      });
+    } catch (e) {
+      console.error('Transcribe trigger failed:', e);
+    }
 
     return res.json({ success: true, callKey: callRef.key, processId });
 
