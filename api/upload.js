@@ -1,5 +1,11 @@
 const admin = require('firebase-admin');
 
+// ★ AI transcription/scoring is turned OFF for now — calls just need to be
+// available for human auditors to listen to and manually score in the
+// Scorecard tab. Flip this back to true later if the AI pipeline is
+// revisited; nothing else needs to change to re-enable it.
+const AI_SCORING_ENABLED = false;
+
 function getDb() {
   if (!admin.apps.length) {
     admin.initializeApp({
@@ -66,40 +72,32 @@ module.exports = async (req, res) => {
       uploadedBy: uploadedBy || null,
       assignedTo: assignedTo || null,
       language: language || 'hi-en',
-      // ★ FIX: use a status the dashboard's queue filters actually recognize
-      // (the old "pending" value matched none of the Pending/Done filters).
-      status: 'pending_transcription',
+      // "ready_for_review" = just sits in the queue with its audio player,
+      // waiting for a human to listen and audit manually. Only becomes
+      // "pending_transcription" if AI_SCORING_ENABLED is turned back on.
+      status: AI_SCORING_ENABLED ? 'pending_transcription' : 'ready_for_review',
       createdAt: new Date().toISOString(),
     });
 
-    // ★ FIX: this call was previously never made — the record sat at
-    // "pending_transcription" forever because nothing told the transcription
-    // pipeline it existed. webhook.js already did this correctly; upload.js
-    // (used by both manual upload and Smartflo Sync) was missing it entirely.
-    // ★ FIX #2: this MUST be awaited. Vercel can terminate a function's
-    // execution the instant it sends its response — a "fire and forget"
-    // fetch() left running in the background can get killed mid-flight
-    // before the request is even delivered. Awaiting it guarantees the
-    // trigger actually happens, at the cost of upload() taking a few
-    // seconds longer to respond (acceptable — the dashboard already shows
-    // "AI is scoring, check back in ~60s" after this call returns).
-    const apiBase = process.env.API_BASE_URL || `https://${process.env.VERCEL_URL}`;
-    try {
-      await fetch(`${apiBase}/api/transcribe`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'x-internal-key': process.env.INTERNAL_API_KEY,
-        },
-        body: JSON.stringify({
-          callKey: callRef.key,
-          processId,
-          recordingUrl,
-          language: language || 'hi-en',
-        }),
-      });
-    } catch (e) {
-      console.error('Transcribe trigger failed:', e);
+    if (AI_SCORING_ENABLED) {
+      const apiBase = process.env.API_BASE_URL || `https://${process.env.VERCEL_URL}`;
+      try {
+        await fetch(`${apiBase}/api/transcribe`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'x-internal-key': process.env.INTERNAL_API_KEY,
+          },
+          body: JSON.stringify({
+            callKey: callRef.key,
+            processId,
+            recordingUrl,
+            language: language || 'hi-en',
+          }),
+        });
+      } catch (e) {
+        console.error('Transcribe trigger failed:', e);
+      }
     }
 
     return res.json({ success: true, callKey: callRef.key, processId });
