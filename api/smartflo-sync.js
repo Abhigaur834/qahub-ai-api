@@ -95,6 +95,7 @@ module.exports = async (req, res) => {
       page = '1',
       limit = '50',
       agentName,  // optional filter, matches agent_name (case-insensitive contains)
+      callType,   // 'connected' | 'not_connected' | 'all' — defaults to 'connected'
     } = req.body || {};
 
     const now = new Date();
@@ -107,13 +108,18 @@ module.exports = async (req, res) => {
     // ── Fetch from Smartflo ─────────────────────────────────────────────
     const token = await getSmartfloToken();
 
-    const qs = new URLSearchParams({
+    const mode = ['connected', 'not_connected', 'all'].includes(callType) ? callType : 'connected';
+
+    const qsParams = {
       from_date: formatSmartfloDate(from),
       to_date:   formatSmartfloDate(to),
       page:      String(page),
       limit:     String(limit),
-      call_type: 'c', // answered calls only — these are the ones with real recordings
-    });
+    };
+    // Ask Smartflo to pre-filter where possible; 'all' omits the filter entirely
+    if (mode === 'connected') qsParams.call_type = 'c';
+    if (mode === 'not_connected') qsParams.call_type = 'm';
+    const qs = new URLSearchParams(qsParams);
 
     const cdrRes = await fetch(`https://api-smartflo.tatateleservices.com/v1/call/records?${qs.toString()}`, {
       method: 'GET',
@@ -128,8 +134,14 @@ module.exports = async (req, res) => {
     const cdrData = await cdrRes.json();
     let results = Array.isArray(cdrData.results) ? cdrData.results : [];
 
-    // Only calls that actually have a recording and real duration
-    results = results.filter(r => r.recording_url && Number(r.call_duration) > 0);
+    // ★ Only require a real recording for "connected" — not-connected calls
+    // never have one, and "all" should show both kinds.
+    results = results.filter(r => {
+      const isConnected = !!(r.recording_url && Number(r.call_duration) > 0);
+      if (mode === 'connected') return isConnected;
+      if (mode === 'not_connected') return !isConnected;
+      return true; // 'all'
+    });
 
     if (agentName) {
       const needle = agentName.toLowerCase();
@@ -143,7 +155,8 @@ module.exports = async (req, res) => {
       date:          r.date,
       time:          r.time,
       durationSec:   r.call_duration,
-      recordingUrl:  r.recording_url,
+      recordingUrl:  r.recording_url || null,
+      connected:     !!(r.recording_url && Number(r.call_duration) > 0),
       direction:     r.direction || null,
       department:    r.department_name || null,
     }));
