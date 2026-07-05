@@ -3,7 +3,9 @@
  *
  * Called by the dashboard right after every audit is saved. Emails the
  * agent their full result — score, which parameters failed, observations,
- * and the coaching recommendation.
+ * and the coaching recommendation. CCs the agent's Team Leader if one is
+ * on file, and includes an acknowledgment link the agent can click to
+ * confirm they've read it (timestamps back onto the audit record).
  *
  * Uses Resend (https://resend.com) — set RESEND_API_KEY. If that env var
  * isn't set yet, this simply skips sending (not an error) so the rest of
@@ -18,8 +20,8 @@ module.exports = async (req, res) => {
   if (req.method !== 'POST') return res.status(405).json({ error: 'Method not allowed' });
 
   const {
-    agentName, agentEmail,
-    processId, totalScore, result, crFatal,
+    agentName, agentEmail, tlEmail,
+    processId, auditKey, totalScore, result, crFatal,
     failedParams, observations, recommendation,
     callDate, reviewer,
   } = req.body || {};
@@ -27,6 +29,7 @@ module.exports = async (req, res) => {
   if (!agentName) return res.status(400).json({ error: 'agentName required' });
 
   const outcome = { email: 'skipped' };
+  const APP_BASE = process.env.APP_BASE_URL || 'https://app.qahub.online';
 
   // ── Email (Resend) ────────────────────────────────────────────────────
   if (process.env.RESEND_API_KEY && agentEmail) {
@@ -36,6 +39,10 @@ module.exports = async (req, res) => {
       const failedList = (failedParams && failedParams.length)
         ? `<ul style="margin:8px 0;padding-left:20px;color:#444">${failedParams.map(p => `<li style="margin-bottom:4px">${escapeHtml(p)}</li>`).join('')}</ul>`
         : '<p style="color:#777;font-size:13px">No parameters failed.</p>';
+
+      const ackLink = (processId && auditKey)
+        ? `${APP_BASE}/ack.html?process=${encodeURIComponent(processId)}&auditId=${encodeURIComponent(auditKey)}`
+        : null;
 
       const html = `
         <div style="font-family:Arial,sans-serif;max-width:560px;margin:0 auto;color:#222">
@@ -50,8 +57,17 @@ module.exports = async (req, res) => {
           ${failedList}
           ${observations ? `<h3 style="margin-bottom:6px;font-size:15px">Observations</h3><p style="color:#444;font-size:13px;line-height:1.6">${escapeHtml(observations)}</p>` : ''}
           ${recommendation ? `<h3 style="margin-bottom:6px;font-size:15px">Coaching Recommendation</h3><p style="color:#444;font-size:13px;line-height:1.6">${escapeHtml(recommendation)}</p>` : ''}
+          ${ackLink ? `<div style="margin:24px 0"><a href="${ackLink}" style="display:inline-block;background:#3d7ef5;color:#fff;text-decoration:none;padding:11px 22px;border-radius:8px;font-weight:700;font-size:13px">I've read this audit →</a></div>` : ''}
           <p style="color:#999;font-size:11px;margin-top:24px;border-top:1px solid #eee;padding-top:12px">This is an automated message from QA.Hub. Speak with your Team Leader if you have questions about this audit.</p>
         </div>`;
+
+      const emailPayload = {
+        from: process.env.RESEND_FROM_EMAIL || 'QA.Hub <onboarding@resend.dev>',
+        to: [agentEmail],
+        subject: `Your call audit result — ${crFatal ? 'FAIL' : (totalScore ?? '—') + '%'}`,
+        html,
+      };
+      if (tlEmail) emailPayload.cc = [tlEmail];
 
       const resendRes = await fetch('https://api.resend.com/emails', {
         method: 'POST',
@@ -59,16 +75,11 @@ module.exports = async (req, res) => {
           'Authorization': `Bearer ${process.env.RESEND_API_KEY}`,
           'Content-Type': 'application/json',
         },
-        body: JSON.stringify({
-          from: process.env.RESEND_FROM_EMAIL || 'QA.Hub <onboarding@resend.dev>',
-          to: [agentEmail],
-          subject: `Your call audit result — ${crFatal ? 'FAIL' : (totalScore ?? '—') + '%'}`,
-          html,
-        }),
+        body: JSON.stringify(emailPayload),
       });
 
       if (!resendRes.ok) throw new Error(`Resend ${resendRes.status}: ${await resendRes.text()}`);
-      outcome.email = 'sent';
+      outcome.email = tlEmail ? 'sent (CC\'d TL)' : 'sent';
     } catch (e) {
       console.error('Email send failed:', e);
       outcome.email = 'failed: ' + e.message;
