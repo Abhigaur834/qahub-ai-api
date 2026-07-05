@@ -6,12 +6,19 @@
     "api/ai-score.js":    { "maxDuration": 120 },
     "api/upload.js":      { "maxDuration": 30  },
     "api/smartflo-sync.js": { "maxDuration": 60 },
-    "api/refresh-stakeholder-dashboards.js": { "maxDuration": 60 }
+    "api/refresh-stakeholder-dashboards.js": { "maxDuration": 60 },
+    "api/notify-agent.js": { "maxDuration": 30 },
+    "api/acknowledge-audit.js": { "maxDuration": 15 },
+    "api/weekly-digest.js": { "maxDuration": 60 }
   },
   "crons": [
     {
       "path": "/api/refresh-stakeholder-dashboards",
       "schedule": "30 18 * * *"
+    },
+    {
+      "path": "/api/weekly-digest",
+      "schedule": "30 3 * * 1"
     }
   ]
 }
