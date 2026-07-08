@@ -134,7 +134,7 @@ module.exports = async (req, res) => {
     let totalAvailable = 0;
     let pagesFetched = 0;
 
-    for (let p = 1; p <= MAX_PAGES; p++) {
+    async function fetchPage(p) {
       const cdrRes = await fetch(`https://api-smartflo.tatateleservices.com/v1/call/records?${buildQs(p).toString()}`, {
         method: 'GET',
         headers: { 'Authorization': `Bearer ${token}`, 'Accept': 'application/json' },
@@ -143,18 +143,40 @@ module.exports = async (req, res) => {
         const errText = await cdrRes.text();
         throw new Error(`Smartflo call records fetch failed (${cdrRes.status}): ${errText}`);
       }
-      const cdrData = await cdrRes.json();
-      pagesFetched++;
-      if (p === 1) totalAvailable = cdrData.count || 0;
+      return cdrRes.json();
+    }
 
-      const pageResults = Array.isArray(cdrData.results) ? cdrData.results : [];
-      if (!pageResults.length) break; // no more data
+    // ── Page 1 first — tells us how many total records exist ──────────────
+    const firstPage = await fetchPage(1);
+    pagesFetched++;
+    totalAvailable = firstPage.count || 0;
+    let pageResults = Array.isArray(firstPage.results) ? firstPage.results : [];
+    matches.push(...pageResults.filter(passesFilter));
 
-      matches.push(...pageResults.filter(passesFilter));
+    // ── Remaining pages, fetched CONCURRENTLY in small batches ─────────────
+    // ★ FIX (timeout): the old version fetched pages one at a time in a
+    // sequential loop — with a busy day spanning many pages, that easily
+    // exceeded Vercel's 60s function limit. Fetching a batch of pages in
+    // parallel (Promise.all) cuts wall-clock time roughly by the batch size,
+    // while still respecting MAX_PAGES / MAX_MATCHES as safety caps.
+    const totalPagesNeeded = Math.min(MAX_PAGES, Math.ceil(totalAvailable / PAGE_SIZE));
+    const BATCH_SIZE = 5; // concurrent requests per batch — safe for most APIs' rate limits
 
-      const recordsSeenSoFar = p * PAGE_SIZE;
-      if (matches.length >= MAX_MATCHES) break;        // enough matches, stop early
-      if (recordsSeenSoFar >= totalAvailable) break;    // covered the whole range
+    for (let batchStart = 2; batchStart <= totalPagesNeeded; batchStart += BATCH_SIZE) {
+      if (matches.length >= MAX_MATCHES) break;
+
+      const batchPages = [];
+      for (let p = batchStart; p < batchStart + BATCH_SIZE && p <= totalPagesNeeded; p++) batchPages.push(p);
+
+      const batchResults = await Promise.all(batchPages.map(p => fetchPage(p)));
+      pagesFetched += batchResults.length;
+
+      for (const cdrData of batchResults) {
+        const results = Array.isArray(cdrData.results) ? cdrData.results : [];
+        matches.push(...results.filter(passesFilter));
+      }
+
+      if (matches.length >= MAX_MATCHES) break;
     }
 
     matches = matches.slice(0, MAX_MATCHES);
