@@ -31,9 +31,6 @@ function getAdmin() {
   return admin;
 }
 
-// Cache the Smartflo token in memory for the life of this serverless instance
-// (tokens are valid for 3600s per Smartflo's docs) so we don't re-login on
-// every call within the same warm invocation.
 let _smartfloToken = null;
 let _smartfloTokenExpiresAt = 0;
 
@@ -57,16 +54,20 @@ async function getSmartfloToken() {
   if (!data.access_token) throw new Error('Smartflo login did not return an access_token');
 
   _smartfloToken = data.access_token;
-  // Refresh a little early (90% of the stated lifetime) to avoid edge-of-expiry failures
   const lifetimeMs = (data.expires_in || 3600) * 1000;
   _smartfloTokenExpiresAt = Date.now() + lifetimeMs * 0.9;
   return _smartfloToken;
 }
 
-// Formats a JS Date as Smartflo expects: "Y-m-d H:i:s"
 function formatSmartfloDate(d) {
   const pad = n => String(n).padStart(2, '0');
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+}
+
+function fetchWithTimeout(url, options, timeoutMs = 12000) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  return fetch(url, { ...options, signal: controller.signal }).finally(() => clearTimeout(timer));
 }
 
 module.exports = async (req, res) => {
@@ -76,7 +77,6 @@ module.exports = async (req, res) => {
   if (req.method !== 'POST') return res.status(405).json({ error: 'Method not allowed' });
 
   try {
-    // ── Verify the request comes from a logged-in dashboard user ──────────
     const authHeader = req.headers['authorization'] || '';
     const idToken = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null;
     if (!idToken) return res.status(401).json({ error: 'Missing Authorization bearer token' });
@@ -88,12 +88,11 @@ module.exports = async (req, res) => {
       return res.status(401).json({ error: 'Invalid or expired session — please log in again' });
     }
 
-    // ── Parse request ───────────────────────────────────────────────────
     const {
-      fromDate,   // optional, "YYYY-MM-DD" — defaults to today
-      toDate,     // optional, "YYYY-MM-DD" — defaults to today
-      agentName,  // optional filter, matches agent_name (case-insensitive contains)
-      callType,   // 'connected' | 'not_connected' | 'all' — defaults to 'connected'
+      fromDate,
+      toDate,
+      agentName,
+      callType,
     } = req.body || {};
 
     const now = new Date();
@@ -103,20 +102,26 @@ module.exports = async (req, res) => {
     const from = fromDate ? new Date(fromDate + ' 00:00:00') : startOfToday;
     const to   = toDate   ? new Date(toDate   + ' 23:59:59') : endOfToday;
 
-    // ── Fetch from Smartflo — paginate across the WHOLE date range ────────
-    // ★ FIX: previously this only ever looked at the first 100 records
-    // (page=1), then filtered by agent within just that slice — so an
-    // agent's calls sitting anywhere else in a busy day were invisible.
-    // Now we page through until either the whole range is covered or we've
-    // collected a healthy number of matches, whichever comes first.
     const token = await getSmartfloToken();
     const mode = ['connected', 'not_connected', 'all'].includes(callType) ? callType : 'connected';
-    const PAGE_SIZE = 100;
-    const MAX_PAGES = 30;   // safety cap: up to 3,000 raw records scanned per request
-    const MAX_MATCHES = 300; // stop early once we have plenty to show
 
-    function buildQs(pageNum) {
-      const p = { from_date: formatSmartfloDate(from), to_date: formatSmartfloDate(to), page: String(pageNum), limit: String(PAGE_SIZE) };
+    // Smartflo's call-record endpoint can become very slow with a large
+    // page size over a busy day. Keep each request small and time-bound so
+    // one slow upstream response cannot consume the whole Vercel function.
+    const PAGE_SIZE = 25;
+    const RETRY_PAGE_SIZE = 10;
+    const MAX_PAGES = 4;
+    const MAX_MATCHES = 100;
+    const BATCH_SIZE = 2;
+    const SMARTFLO_TIMEOUT_MS = 12000;
+
+    function buildQs(pageNum, limit) {
+      const p = {
+        from_date: formatSmartfloDate(from),
+        to_date: formatSmartfloDate(to),
+        page: String(pageNum),
+        limit: String(limit),
+      };
       if (mode === 'connected') p.call_type = 'c';
       if (mode === 'not_connected') p.call_type = 'm';
       return new URLSearchParams(p);
@@ -130,38 +135,50 @@ module.exports = async (req, res) => {
       return true;
     }
 
+    async function fetchPage(pageNum, limit = PAGE_SIZE) {
+      const url = `https://api-smartflo.tatateleservices.com/v1/call/records?${buildQs(pageNum, limit).toString()}`;
+      try {
+        const cdrRes = await fetchWithTimeout(url, {
+          method: 'GET',
+          headers: { 'Authorization': `Bearer ${token}`, 'Accept': 'application/json' },
+        }, SMARTFLO_TIMEOUT_MS);
+        if (!cdrRes.ok) {
+          const errText = await cdrRes.text();
+          throw new Error(`Smartflo call records fetch failed (${cdrRes.status}): ${errText}`);
+        }
+        return await cdrRes.json();
+      } catch (error) {
+        if (pageNum === 1 && limit === PAGE_SIZE && (error?.name === 'AbortError' || /timed? ?out|timeout/i.test(error?.message || ''))) {
+          console.warn('Smartflo first page timed out at 25 rows; retrying with 10 rows');
+          const retryUrl = `https://api-smartflo.tatateleservices.com/v1/call/records?${buildQs(1, RETRY_PAGE_SIZE).toString()}`;
+          const retryRes = await fetchWithTimeout(retryUrl, {
+            method: 'GET',
+            headers: { 'Authorization': `Bearer ${token}`, 'Accept': 'application/json' },
+          }, SMARTFLO_TIMEOUT_MS);
+          if (!retryRes.ok) {
+            const errText = await retryRes.text();
+            throw new Error(`Smartflo call records fetch failed (${retryRes.status}): ${errText}`);
+          }
+          return retryRes.json();
+        }
+        if (error?.name === 'AbortError') {
+          throw new Error(`Smartflo call records request timed out after ${SMARTFLO_TIMEOUT_MS / 1000}s`);
+        }
+        throw error;
+      }
+    }
+
     let matches = [];
     let totalAvailable = 0;
     let pagesFetched = 0;
 
-    async function fetchPage(p) {
-      const cdrRes = await fetch(`https://api-smartflo.tatateleservices.com/v1/call/records?${buildQs(p).toString()}`, {
-        method: 'GET',
-        headers: { 'Authorization': `Bearer ${token}`, 'Accept': 'application/json' },
-      });
-      if (!cdrRes.ok) {
-        const errText = await cdrRes.text();
-        throw new Error(`Smartflo call records fetch failed (${cdrRes.status}): ${errText}`);
-      }
-      return cdrRes.json();
-    }
-
-    // ── Page 1 first — tells us how many total records exist ──────────────
     const firstPage = await fetchPage(1);
     pagesFetched++;
     totalAvailable = firstPage.count || 0;
-    let pageResults = Array.isArray(firstPage.results) ? firstPage.results : [];
-    matches.push(...pageResults.filter(passesFilter));
+    const firstResults = Array.isArray(firstPage.results) ? firstPage.results : [];
+    matches.push(...firstResults.filter(passesFilter));
 
-    // ── Remaining pages, fetched CONCURRENTLY in small batches ─────────────
-    // ★ FIX (timeout): the old version fetched pages one at a time in a
-    // sequential loop — with a busy day spanning many pages, that easily
-    // exceeded Vercel's 60s function limit. Fetching a batch of pages in
-    // parallel (Promise.all) cuts wall-clock time roughly by the batch size,
-    // while still respecting MAX_PAGES / MAX_MATCHES as safety caps.
     const totalPagesNeeded = Math.min(MAX_PAGES, Math.ceil(totalAvailable / PAGE_SIZE));
-    const BATCH_SIZE = 5; // concurrent requests per batch — safe for most APIs' rate limits
-
     for (let batchStart = 2; batchStart <= totalPagesNeeded; batchStart += BATCH_SIZE) {
       if (matches.length >= MAX_MATCHES) break;
 
@@ -175,8 +192,6 @@ module.exports = async (req, res) => {
         const results = Array.isArray(cdrData.results) ? cdrData.results : [];
         matches.push(...results.filter(passesFilter));
       }
-
-      if (matches.length >= MAX_MATCHES) break;
     }
 
     matches = matches.slice(0, MAX_MATCHES);
@@ -208,6 +223,4 @@ module.exports = async (req, res) => {
   }
 };
 
-// ★ The pagination loop above can make up to 30 sequential requests to
-// Smartflo when searching a busy day — raise the timeout accordingly.
 module.exports.config = { maxDuration: 60 };
