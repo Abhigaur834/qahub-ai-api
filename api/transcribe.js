@@ -15,7 +15,7 @@ function getDb() {
 }
 
 const SUPPORTED_LANGUAGES = new Set([
-  'hi-en', 'en', 'hi', 'ta', 'te', 'kn', 'mr', 'gu', 'bn', 'ml'
+  'hi-en', 'multi', 'en', 'hi', 'ta', 'te', 'kn', 'mr', 'gu', 'bn', 'ml'
 ]);
 
 async function fetchWithTimeout(url, options = {}, timeoutMs = 30000) {
@@ -28,7 +28,11 @@ async function fetchWithTimeout(url, options = {}, timeoutMs = 30000) {
   }
 }
 
+let smartfloToken = null;
+let smartfloTokenExpiresAt = 0;
+
 async function getSmartfloToken() {
+  if (smartfloToken && Date.now() < smartfloTokenExpiresAt) return smartfloToken;
   const email = process.env.SMARTFLO_EMAIL;
   const password = process.env.SMARTFLO_PASSWORD;
   if (!email || !password) return null;
@@ -38,37 +42,24 @@ async function getSmartfloToken() {
     headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
     body: JSON.stringify({ email, password }),
   }, 10000);
-
   if (!res.ok) throw new Error(`Smartflo authentication failed (${res.status})`);
   const data = await res.json();
   if (!data.access_token) throw new Error('Smartflo authentication returned no access token');
-  return data.access_token;
+  smartfloToken = data.access_token;
+  smartfloTokenExpiresAt = Date.now() + ((data.expires_in || 3600) * 1000 * 0.9);
+  return smartfloToken;
 }
 
 async function downloadRecording(recordingUrl) {
   let token = null;
-  try {
-    token = await getSmartfloToken();
-  } catch (e) {
-    console.warn('Smartflo auth for recording unavailable:', e.message);
-  }
+  try { token = await getSmartfloToken(); } catch (e) { console.warn('Smartflo recording auth unavailable:', e.message); }
 
-  // Smartflo CDR recording_url is normally a signed URL. Some accounts with
-  // protected recordings also require the authenticated bearer token.
   const headerVariants = [
-    token ? {
-      Authorization: `Bearer ${token}`,
-      Accept: 'audio/*,application/octet-stream,*/*',
-      'User-Agent': 'QA.Hub-AI/1.0',
-    } : null,
-    {
-      Accept: 'audio/*,application/octet-stream,*/*',
-      'User-Agent': 'QA.Hub-AI/1.0',
-    },
+    token ? { Authorization: `Bearer ${token}`, Accept: 'audio/*,application/octet-stream,*/*', 'User-Agent': 'QA.Hub-AI/1.0' } : null,
+    { Accept: 'audio/*,application/octet-stream,*/*', 'User-Agent': 'QA.Hub-AI/1.0' },
   ].filter(Boolean);
 
   let lastError = 'unknown recording download error';
-
   for (let attempt = 0; attempt < headerVariants.length; attempt++) {
     try {
       const audioRes = await fetchWithTimeout(recordingUrl, {
@@ -81,7 +72,6 @@ async function downloadRecording(recordingUrl) {
       } else {
         const contentType = (audioRes.headers.get('content-type') || '').split(';')[0].trim().toLowerCase();
         const audioBuffer = Buffer.from(await audioRes.arrayBuffer());
-
         if (!audioBuffer.length) {
           lastError = 'empty response body';
         } else {
@@ -106,19 +96,18 @@ async function downloadRecording(recordingUrl) {
     } catch (e) {
       lastError = e.name === 'AbortError' ? 'request timeout' : e.message;
     }
-
-    if (attempt < headerVariants.length - 1) {
-      await new Promise(r => setTimeout(r, 1500));
-    }
+    if (attempt < headerVariants.length - 1) await new Promise(r => setTimeout(r, 1000));
   }
-
   throw new Error(`Smartflo recording download failed: ${lastError}`);
 }
 
 async function transcribeWithDeepgram({ audioBuffer, mime, recordingUrl, lang }) {
+  // Deepgram Nova-3 uses language=multi for Hindi+English code-switching.
+  // The UI label "hi-en" maps to the API value "multi".
+  const dgLanguage = lang === 'hi-en' ? 'multi' : lang;
   const options = new URLSearchParams({
     model: 'nova-3',
-    language: lang,
+    language: dgLanguage,
     diarize: 'true',
     punctuate: 'true',
     utterances: 'true',
@@ -140,7 +129,6 @@ async function transcribeWithDeepgram({ audioBuffer, mime, recordingUrl, lang })
   );
 
   if (binaryRes.ok) return binaryRes.json();
-
   const binaryError = `${binaryRes.status}: ${(await binaryRes.text()).slice(0, 300)}`;
 
   const remoteRes = await fetchWithTimeout(
@@ -155,7 +143,6 @@ async function transcribeWithDeepgram({ audioBuffer, mime, recordingUrl, lang })
     },
     20000
   );
-
   if (remoteRes.ok) return remoteRes.json();
 
   const remoteError = `${remoteRes.status}: ${(await remoteRes.text()).slice(0, 300)}`;
@@ -163,15 +150,11 @@ async function transcribeWithDeepgram({ audioBuffer, mime, recordingUrl, lang })
 }
 
 module.exports = async (req, res) => {
-  if (req.headers['x-internal-key'] !== process.env.INTERNAL_API_KEY) {
-    return res.status(401).json({ error: 'Unauthorized' });
-  }
+  if (req.headers['x-internal-key'] !== process.env.INTERNAL_API_KEY) return res.status(401).json({ error: 'Unauthorized' });
   if (req.method !== 'POST') return res.status(405).end();
 
   const { callKey, processId, recordingUrl, language } = req.body || {};
-  if (!callKey || !processId || !recordingUrl) {
-    return res.status(400).json({ error: 'callKey, processId, recordingUrl required' });
-  }
+  if (!callKey || !processId || !recordingUrl) return res.status(400).json({ error: 'callKey, processId, recordingUrl required' });
 
   const lang = SUPPORTED_LANGUAGES.has(language) ? language : 'hi-en';
   const db = getDb();
@@ -179,19 +162,14 @@ module.exports = async (req, res) => {
 
   try {
     await callRef.update({ status: 'transcribing', error: null });
-
     const { audioBuffer, mime } = await downloadRecording(recordingUrl);
     const dgData = await transcribeWithDeepgram({ audioBuffer, mime, recordingUrl, lang });
     const utterances = dgData.results?.utterances || [];
-
-    if (!utterances.length) {
-      throw new Error('Deepgram returned no utterances — recording may be silent, empty, or unsupported');
-    }
+    if (!utterances.length) throw new Error('Deepgram returned no utterances — recording may be silent, empty, or unsupported');
 
     const speakerMap = {};
     let speakerIdx = 0;
     const LABELS = ['Agent', 'Customer', 'Agent2', 'Supervisor'];
-
     const segments = utterances.map(u => {
       if (speakerMap[u.speaker] === undefined) {
         speakerMap[u.speaker] = LABELS[speakerIdx] || `Speaker${speakerIdx}`;
@@ -207,10 +185,8 @@ module.exports = async (req, res) => {
     }).filter(s => s.text);
 
     const fullTranscript = segments.map(s => `[${s.speaker}] ${s.text}`).join('\n');
-    const agentWords = segments.filter(s => s.speaker === 'Agent')
-      .reduce((n, s) => n + s.text.split(/\s+/).filter(Boolean).length, 0);
-    const custWords = segments.filter(s => s.speaker === 'Customer')
-      .reduce((n, s) => n + s.text.split(/\s+/).filter(Boolean).length, 0);
+    const agentWords = segments.filter(s => s.speaker === 'Agent').reduce((n, s) => n + s.text.split(/\s+/).filter(Boolean).length, 0);
+    const custWords = segments.filter(s => s.speaker === 'Customer').reduce((n, s) => n + s.text.split(/\s+/).filter(Boolean).length, 0);
     const totalDur = segments.length ? segments[segments.length - 1].end : 0;
 
     await callRef.update({
@@ -223,9 +199,7 @@ module.exports = async (req, res) => {
           totalSegments: segments.length,
           agentWords,
           customerWords: custWords,
-          talkRatio: agentWords + custWords > 0
-            ? parseFloat((agentWords / (agentWords + custWords) * 100).toFixed(1))
-            : 0,
+          talkRatio: agentWords + custWords > 0 ? parseFloat((agentWords / (agentWords + custWords) * 100).toFixed(1)) : 0,
           durationSeconds: totalDur,
         },
       },
@@ -236,32 +210,18 @@ module.exports = async (req, res) => {
     const apiBase = process.env.API_BASE_URL || `https://${process.env.VERCEL_URL}`;
     const scoreRes = await fetchWithTimeout(`${apiBase}/api/ai-score`, {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'x-internal-key': process.env.INTERNAL_API_KEY,
-      },
+      headers: { 'Content-Type': 'application/json', 'x-internal-key': process.env.INTERNAL_API_KEY },
       body: JSON.stringify({ callKey, processId, transcript: fullTranscript, segments }),
     }, 15000);
-
     if (!scoreRes.ok) {
       const text = await scoreRes.text();
       throw new Error(`AI scoring failed (${scoreRes.status}): ${text.slice(0, 500)}`);
     }
 
-    return res.status(200).json({
-      success: true,
-      segments: segments.length,
-      agentWords,
-      custWords,
-      language: lang,
-    });
-
+    return res.status(200).json({ success: true, segments: segments.length, agentWords, custWords, language: lang, deepgramLanguage: lang === 'hi-en' ? 'multi' : lang });
   } catch (error) {
     console.error('Transcription error:', error);
-    await callRef.update({
-      status: 'transcription_failed',
-      error: error.message,
-    }).catch(() => {});
+    await callRef.update({ status: 'transcription_failed', error: error.message }).catch(() => {});
     return res.status(500).json({ error: error.message });
   }
 };
