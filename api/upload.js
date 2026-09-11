@@ -59,12 +59,15 @@ module.exports = async (req, res) => {
       uploadedBy: uploadedBy || null,
       assignedTo: assignedTo || null,
       language: language || 'hi-en',
-      status: AI_SCORING_ENABLED ? 'pending_transcription' : 'ready_for_review',
+      status: 'pending_transcription',
       createdAt: new Date().toISOString(),
     });
 
     if (AI_SCORING_ENABLED) {
-      const apiBase = process.env.API_BASE_URL || `https://${process.env.VERCEL_URL}`;
+      // Always call the known production API directly. This avoids a stale or
+      // incorrect API_BASE_URL / deployment URL leaving calls stranded at
+      // pending_transcription without ever reaching /api/transcribe.
+      const apiBase = 'https://qahub-ai-api-glz7.vercel.app';
       try {
         const trRes = await fetch(`${apiBase}/api/transcribe`, {
           method: 'POST',
@@ -82,6 +85,10 @@ module.exports = async (req, res) => {
         if (!trRes.ok) {
           const text = await trRes.text();
           console.error('Transcribe trigger returned non-2xx:', trRes.status, text);
+          await callRef.update({
+            status: 'transcription_failed',
+            error: `Transcribe trigger failed (${trRes.status})`,
+          }).catch(() => {});
         }
       } catch (e) {
         console.error('Transcribe trigger failed:', e);
