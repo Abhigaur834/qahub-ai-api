@@ -12,7 +12,7 @@ function getDb() {
       credential: admin.credential.cert({
         projectId:   process.env.FIREBASE_PROJECT_ID,
         clientEmail: process.env.FIREBASE_CLIENT_EMAIL,
-        privateKey:  process.env.FIREBASE_PRIVATE_KEY?.replace(/\\n/g, '\n'),
+        privateKey: process.env.FIREBASE_PRIVATE_KEY?.replace(/\\n/g, '\n'),
       }),
       databaseURL: process.env.FIREBASE_DATABASE_URL,
     });
@@ -24,6 +24,16 @@ const SUPPORTED_LANGUAGES = new Set([
   'hi-en', 'en', 'hi', 'ta', 'te', 'kn', 'mr', 'gu', 'bn', 'ml'
 ]);
 
+async function fetchWithTimeout(url, options = {}, timeoutMs = 45000) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, { ...options, redirect: 'follow', signal: controller.signal });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 module.exports = async (req, res) => {
   // Internal-only endpoint
   if (req.headers['x-internal-key'] !== process.env.INTERNAL_API_KEY) {
@@ -31,21 +41,53 @@ module.exports = async (req, res) => {
   }
   if (req.method !== 'POST') return res.status(405).end();
 
-  const { callKey, processId, recordingUrl, language } = req.body;
+  const { callKey, processId, recordingUrl, language } = req.body || {};
   if (!callKey || !processId || !recordingUrl) {
     return res.status(400).json({ error: 'callKey, processId, recordingUrl required' });
   }
 
-  // Use requested language, fall back to hi-en if unsupported
   const lang    = SUPPORTED_LANGUAGES.has(language) ? language : 'hi-en';
   const db      = getDb();
   const callRef = db.ref(`processes/${processId}/calls/${callKey}`);
 
   try {
-    await callRef.update({ status: 'transcribing' });
+    await callRef.update({ status: 'transcribing', error: null });
 
-    // ── Call Deepgram nova-2 ─────────────────────────────────────────────────
-    const dgRes = await fetch(
+    // Smartflo recording URLs can be pre-authorized for a browser but rejected
+    // when Deepgram tries to fetch them directly. Download the audio ourselves
+    // first, then send the actual bytes to Deepgram. This also lets us surface
+    // a clear error if the recording URL is expired/inaccessible.
+    let audioRes;
+    try {
+      audioRes = await fetchWithTimeout(recordingUrl, {
+        method: 'GET',
+        headers: {
+          'Accept': 'audio/*,application/octet-stream,*/*',
+          'User-Agent': 'QA.Hub-AI/1.0',
+        },
+      }, 45000);
+    } catch (e) {
+      throw new Error(`Recording download failed: ${e.name === 'AbortError' ? 'timeout after 45s' : e.message}`);
+    }
+
+    if (!audioRes.ok) {
+      throw new Error(`Recording download failed (${audioRes.status})`);
+    }
+
+    const audioType = (audioRes.headers.get('content-type') || 'audio/mpeg').split(';')[0].trim();
+    const audioBuffer = Buffer.from(await audioRes.arrayBuffer());
+
+    if (!audioBuffer.length) {
+      throw new Error('Recording download returned an empty audio file');
+    }
+
+    // Guard against Smartflo returning an HTML/login page instead of audio.
+    if (audioType.includes('text/html')) {
+      throw new Error('Smartflo recording URL returned HTML instead of audio; the recording link may be expired');
+    }
+
+    // ── Call Deepgram nova-2 with the downloaded audio bytes ────────────────
+    const dgRes = await fetchWithTimeout(
       'https://api.deepgram.com/v1/listen?' + new URLSearchParams({
         model:        'nova-2',
         language:     lang,
@@ -54,15 +96,16 @@ module.exports = async (req, res) => {
         utterances:   'true',
         smart_format: 'true',
         filler_words: 'false',
-      }),
+      }).toString(),
       {
-        method:  'POST',
+        method: 'POST',
         headers: {
           Authorization: `Token ${process.env.DEEPGRAM_API_KEY}`,
-          'Content-Type': 'application/json',
+          'Content-Type': audioType.startsWith('audio/') ? audioType : 'audio/mpeg',
         },
-        body: JSON.stringify({ url: recordingUrl }),
-      }
+        body: audioBuffer,
+      },
+      45000
     );
 
     if (!dgRes.ok) {
@@ -76,7 +119,6 @@ module.exports = async (req, res) => {
       throw new Error('Deepgram returned no utterances — recording may be silent or inaccessible');
     }
 
-    // ── Map speaker IDs → human labels ──────────────────────────────────────
     const speakerMap = {};
     let   speakerIdx = 0;
     const LABELS     = ['Agent', 'Customer', 'Agent2', 'Supervisor'];
@@ -98,10 +140,10 @@ module.exports = async (req, res) => {
     const fullTranscript = segments.map(s => `[${s.speaker}] ${s.text}`).join('\n');
     const agentWords     = segments
       .filter(s => s.speaker === 'Agent')
-      .reduce((n, s) => n + s.text.split(' ').length, 0);
+      .reduce((n, s) => n + s.text.split(/\s+/).filter(Boolean).length, 0);
     const custWords      = segments
       .filter(s => s.speaker === 'Customer')
-      .reduce((n, s) => n + s.text.split(' ').length, 0);
+      .reduce((n, s) => n + s.text.split(/\s+/).filter(Boolean).length, 0);
     const totalDur       = segments.length ? segments[segments.length - 1].end : 0;
 
     await callRef.update({
@@ -124,25 +166,24 @@ module.exports = async (req, res) => {
       transcribedAt: new Date().toISOString(),
     });
 
-    // ── Trigger AI scoring ───────────────────────────────────────────────────
-    // ★ FIX: this MUST be awaited, not fire-and-forget. Vercel can terminate
-    // this function's execution the instant it returns its response — an
-    // un-awaited fetch() left running in the background can get killed
-    // before the request to /api/ai-score is ever actually delivered. That
-    // silently stranded every call at status "ai_scoring" forever, exactly
-    // like the same bug did for the upload → transcribe handoff.
+    // ── Trigger AI scoring ────────────────────────────────────────────────
     try {
       const apiBase = process.env.API_BASE_URL || `https://${process.env.VERCEL_URL}`;
-      await fetch(`${apiBase}/api/ai-score`, {
+      const scoreRes = await fetchWithTimeout(`${apiBase}/api/ai-score`, {
         method:  'POST',
         headers: {
           'Content-Type':   'application/json',
           'x-internal-key': process.env.INTERNAL_API_KEY,
         },
         body: JSON.stringify({ callKey, processId, transcript: fullTranscript, segments }),
-      });
+      }, 45000);
+      if (!scoreRes.ok) {
+        throw new Error(`AI score returned ${scoreRes.status}: ${await scoreRes.text()}`);
+      }
     } catch (e) {
       console.error('AI score trigger failed:', e);
+      await callRef.update({ status: 'ai_scoring_failed', error: e.message }).catch(() => {});
+      return res.status(502).json({ error: e.message });
     }
 
     return res.status(200).json({
@@ -163,7 +204,4 @@ module.exports = async (req, res) => {
   }
 };
 
-// ★ FIX: this function now awaits the full ai-score call before returning
-// (see above), on top of its own Deepgram transcription time. Raise the
-// timeout to the Hobby-plan maximum of 60s so both fit comfortably.
 module.exports.config = { maxDuration: 60 };
