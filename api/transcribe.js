@@ -28,48 +28,91 @@ async function fetchWithTimeout(url, options = {}, timeoutMs = 30000) {
   }
 }
 
+async function getSmartfloToken() {
+  const email = process.env.SMARTFLO_EMAIL;
+  const password = process.env.SMARTFLO_PASSWORD;
+  if (!email || !password) return null;
+
+  const res = await fetchWithTimeout('https://api-smartflo.tatateleservices.com/v1/auth/login', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
+    body: JSON.stringify({ email, password }),
+  }, 10000);
+
+  if (!res.ok) throw new Error(`Smartflo authentication failed (${res.status})`);
+  const data = await res.json();
+  if (!data.access_token) throw new Error('Smartflo authentication returned no access token');
+  return data.access_token;
+}
+
 async function downloadRecording(recordingUrl) {
+  let token = null;
   try {
-    const audioRes = await fetchWithTimeout(recordingUrl, {
-      method: 'GET',
-      headers: {
-        'Accept': 'audio/*,application/octet-stream,*/*',
-        'User-Agent': 'QA.Hub-AI/1.0',
-      },
-    }, 30000);
-
-    if (!audioRes.ok) {
-      throw new Error(`recording download HTTP ${audioRes.status}`);
-    }
-
-    const contentType = (audioRes.headers.get('content-type') || '').split(';')[0].trim().toLowerCase();
-    const audioBuffer = Buffer.from(await audioRes.arrayBuffer());
-
-    if (!audioBuffer.length) throw new Error('recording download returned an empty file');
-
-    const preview = audioBuffer.subarray(0, 64).toString('utf8').trim().toLowerCase();
-    if (contentType.includes('text/html') || preview.startsWith('<!doctype') || preview.startsWith('<html')) {
-      throw new Error('recording URL returned HTML instead of audio');
-    }
-
-    // Prefer Smartflo's declared MIME type, otherwise infer common formats from
-    // the URL path. Deepgram accepts containerized audio when the content type
-    // correctly describes the submitted bytes.
-    let mime = contentType;
-    if (!mime || mime === 'application/octet-stream') {
-      const path = new URL(recordingUrl).pathname.toLowerCase();
-      if (path.endsWith('.wav')) mime = 'audio/wav';
-      else if (path.endsWith('.ogg')) mime = 'audio/ogg';
-      else if (path.endsWith('.webm')) mime = 'audio/webm';
-      else if (path.endsWith('.mp3')) mime = 'audio/mpeg';
-      else if (path.endsWith('.m4a')) mime = 'audio/mp4';
-      else mime = 'application/octet-stream';
-    }
-
-    return { audioBuffer, mime };
-  } catch (error) {
-    throw new Error(`Smartflo recording download failed: ${error.name === 'AbortError' ? 'timeout after 30s' : error.message}`);
+    token = await getSmartfloToken();
+  } catch (e) {
+    console.warn('Smartflo auth for recording unavailable:', e.message);
   }
+
+  // Smartflo CDR recording_url is normally a signed URL. Some accounts with
+  // protected recordings also require the authenticated bearer token.
+  const headerVariants = [
+    token ? {
+      Authorization: `Bearer ${token}`,
+      Accept: 'audio/*,application/octet-stream,*/*',
+      'User-Agent': 'QA.Hub-AI/1.0',
+    } : null,
+    {
+      Accept: 'audio/*,application/octet-stream,*/*',
+      'User-Agent': 'QA.Hub-AI/1.0',
+    },
+  ].filter(Boolean);
+
+  let lastError = 'unknown recording download error';
+
+  for (let attempt = 0; attempt < headerVariants.length; attempt++) {
+    try {
+      const audioRes = await fetchWithTimeout(recordingUrl, {
+        method: 'GET',
+        headers: headerVariants[attempt],
+      }, 12000);
+
+      if (!audioRes.ok) {
+        lastError = `HTTP ${audioRes.status}`;
+      } else {
+        const contentType = (audioRes.headers.get('content-type') || '').split(';')[0].trim().toLowerCase();
+        const audioBuffer = Buffer.from(await audioRes.arrayBuffer());
+
+        if (!audioBuffer.length) {
+          lastError = 'empty response body';
+        } else {
+          const preview = audioBuffer.subarray(0, 64).toString('utf8').trim().toLowerCase();
+          if (contentType.includes('text/html') || preview.startsWith('<!doctype') || preview.startsWith('<html')) {
+            lastError = 'Smartflo returned HTML/login content instead of audio';
+          } else {
+            let mime = contentType;
+            if (!mime || mime === 'application/octet-stream') {
+              const path = new URL(recordingUrl).pathname.toLowerCase();
+              if (path.endsWith('.wav')) mime = 'audio/wav';
+              else if (path.endsWith('.ogg')) mime = 'audio/ogg';
+              else if (path.endsWith('.webm')) mime = 'audio/webm';
+              else if (path.endsWith('.mp3')) mime = 'audio/mpeg';
+              else if (path.endsWith('.m4a')) mime = 'audio/mp4';
+              else mime = 'audio/mpeg';
+            }
+            return { audioBuffer, mime };
+          }
+        }
+      }
+    } catch (e) {
+      lastError = e.name === 'AbortError' ? 'request timeout' : e.message;
+    }
+
+    if (attempt < headerVariants.length - 1) {
+      await new Promise(r => setTimeout(r, 1500));
+    }
+  }
+
+  throw new Error(`Smartflo recording download failed: ${lastError}`);
 }
 
 async function transcribeWithDeepgram({ audioBuffer, mime, recordingUrl, lang }) {
@@ -83,8 +126,6 @@ async function transcribeWithDeepgram({ audioBuffer, mime, recordingUrl, lang })
     filler_words: 'false',
   });
 
-  // First attempt: submit the actual audio bytes. This avoids authentication
-  // differences between a browser and Deepgram accessing Smartflo's URL.
   const binaryRes = await fetchWithTimeout(
     `https://api.deepgram.com/v1/listen?${options.toString()}`,
     {
@@ -95,16 +136,13 @@ async function transcribeWithDeepgram({ audioBuffer, mime, recordingUrl, lang })
       },
       body: audioBuffer,
     },
-    45000
+    30000
   );
 
   if (binaryRes.ok) return binaryRes.json();
 
   const binaryError = `${binaryRes.status}: ${(await binaryRes.text()).slice(0, 300)}`;
 
-  // Second attempt: let Deepgram fetch the pre-authorized Smartflo URL itself.
-  // Some Smartflo recording links are accessible to Deepgram even when the
-  // Vercel runtime receives an unexpected content type from the URL.
   const remoteRes = await fetchWithTimeout(
     `https://api.deepgram.com/v1/listen?${options.toString()}`,
     {
@@ -115,7 +153,7 @@ async function transcribeWithDeepgram({ audioBuffer, mime, recordingUrl, lang })
       },
       body: JSON.stringify({ url: recordingUrl }),
     },
-    45000
+    20000
   );
 
   if (remoteRes.ok) return remoteRes.json();
@@ -203,7 +241,7 @@ module.exports = async (req, res) => {
         'x-internal-key': process.env.INTERNAL_API_KEY,
       },
       body: JSON.stringify({ callKey, processId, transcript: fullTranscript, segments }),
-    }, 45000);
+    }, 15000);
 
     if (!scoreRes.ok) {
       const text = await scoreRes.text();
