@@ -159,7 +159,8 @@ module.exports = async (req, res) => {
         body: JSON.stringify({
           contents: [{ parts: [{ text: SCORECARD_PROMPT + '\n\nCALL TRANSCRIPT:\n' + transcript }] }],
           generationConfig: {
-            maxOutputTokens: 1500,
+            maxOutputTokens: 4096,
+            responseMimeType: 'application/json',
           },
         }),
       }
@@ -171,8 +172,12 @@ module.exports = async (req, res) => {
     }
 
     const geminiData = await geminiRes.json();
+    const finishReason = geminiData.candidates?.[0]?.finishReason;
     const rawText = geminiData.candidates?.[0]?.content?.parts?.[0]?.text || '';
     if (!rawText) throw new Error('Gemini returned empty response');
+    if (finishReason === 'MAX_TOKENS') {
+      throw new Error('Gemini hit the token limit before finishing — response was truncated');
+    }
 
     let parsed;
     try {
