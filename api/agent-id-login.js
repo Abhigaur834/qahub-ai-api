@@ -43,7 +43,6 @@ async function findAgent(db, empId) {
     }
   }
 
-  // Legacy fallback.
   const legacy = await db.ref('agents').once('value');
   if (legacy.exists()) {
     for (const [id, agent] of Object.entries(legacy.val())) {
@@ -57,8 +56,9 @@ async function findAgent(db, empId) {
 }
 
 async function verifyPassword(email, password) {
-  const apiKey = process.env.FIREBASE_WEB_API_KEY;
-  if (!apiKey) fail('FIREBASE_WEB_API_KEY is not configured on the API', 500);
+  // Firebase Web API keys are intended to identify the Firebase project; the
+  // password itself is sent only over HTTPS to Firebase Auth.
+  const apiKey = process.env.FIREBASE_WEB_API_KEY || 'AIzaSyCifkNrq_PA8FtW7devgVsaNGXW-Tce0n8';
 
   const response = await fetch(
     `https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key=${apiKey}`,
@@ -106,13 +106,13 @@ module.exports = async (req, res) => {
     const customToken = await auth.createCustomToken(user.uid, {
       role: 'agent',
       empId: String(agent.empId || empId),
-      processId: String(agent.processId || agent.process || agent.processId || ''),
+      processId: String(agent.processId || agent.process || ''),
     });
 
     return res.status(200).json({
       success: true,
       token: customToken,
-      processId: agent.processId || agent.process || agent.processId || null,
+      processId: agent.processId || agent.process || null,
       agentName: agent.name || null,
     });
   } catch (error) {
