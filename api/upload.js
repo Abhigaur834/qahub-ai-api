@@ -50,6 +50,26 @@ module.exports = async (req, res) => {
 
     const db = getDb();
 
+    // Idempotency guard: if this same recording was already submitted for
+    // this process in the last 24h and isn't in a dead ERROR state, don't
+    // create a duplicate entry (protects against double-click uploads and
+    // overlapping Smartflo sync runs re-submitting the same call).
+    const DUPLICATE_WINDOW_MS = 24 * 60 * 60 * 1000;
+    const recentSnap = await db.ref(`processes/${processId}/calls`)
+      .orderByChild('recordingUrl')
+      .equalTo(recordingUrl)
+      .once('value');
+    if (recentSnap.exists()) {
+      const existing = recentSnap.val();
+      for (const [key, call] of Object.entries(existing)) {
+        const age = Date.now() - new Date(call.createdAt || 0).getTime();
+        const isDeadFailure = call.status === 'transcription_failed' || call.status === 'ai_scoring_failed';
+        if (age < DUPLICATE_WINDOW_MS && !isDeadFailure) {
+          return res.json({ success: true, callKey: key, processId, deduplicated: true });
+        }
+      }
+    }
+
     const callRef = await db.ref(`processes/${processId}/calls`).push({
       processId,
       recordingUrl,
