@@ -108,11 +108,17 @@ module.exports = async (req, res) => {
     // Smartflo's call-record endpoint can become very slow with a large
     // page size over a busy day. Keep each request small and time-bound so
     // one slow upstream response cannot consume the whole Vercel function.
-    const PAGE_SIZE = 25;
+    // Raised from the original 4 pages / 100 records — that cap made a
+    // sync over any date range wider than a day or two silently stop
+    // scanning long before reaching most of the actual call volume, with
+    // no indication to the user that anything was cut short. This is
+    // still a hard ceiling (Vercel's 60s function limit means we can't
+    // scan unlimited records in one request), just a much more usable one.
+    const PAGE_SIZE = 50;
     const RETRY_PAGE_SIZE = 10;
-    const MAX_PAGES = 4;
-    const MAX_MATCHES = 100;
-    const BATCH_SIZE = 2;
+    const MAX_PAGES = 10;
+    const MAX_MATCHES = 300;
+    const BATCH_SIZE = 3;
     const SMARTFLO_TIMEOUT_MS = 12000;
 
     function buildQs(pageNum, limit) {
@@ -171,11 +177,13 @@ module.exports = async (req, res) => {
     let matches = [];
     let totalAvailable = 0;
     let pagesFetched = 0;
+    let recordsScanned = 0;
 
     const firstPage = await fetchPage(1);
     pagesFetched++;
     totalAvailable = firstPage.count || 0;
     const firstResults = Array.isArray(firstPage.results) ? firstPage.results : [];
+    recordsScanned += firstResults.length;
     matches.push(...firstResults.filter(passesFilter));
 
     const totalPagesNeeded = Math.min(MAX_PAGES, Math.ceil(totalAvailable / PAGE_SIZE));
@@ -190,6 +198,7 @@ module.exports = async (req, res) => {
 
       for (const cdrData of batchResults) {
         const results = Array.isArray(cdrData.results) ? cdrData.results : [];
+        recordsScanned += results.length;
         matches.push(...results.filter(passesFilter));
       }
     }
@@ -213,7 +222,9 @@ module.exports = async (req, res) => {
       success: true,
       count: calls.length,
       totalAvailable,
+      recordsScanned,
       pagesFetched,
+      truncated: recordsScanned < totalAvailable,
       calls,
     });
 
