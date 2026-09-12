@@ -1,4 +1,5 @@
 const admin = require('firebase-admin');
+const { withRetry, sendFailureAlert } = require('./_lib/reliability');
 
 /**
  * QA.Hub — AI Scoring via Google Gemini Flash
@@ -150,28 +151,35 @@ module.exports = async (req, res) => {
     const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
     if (!GEMINI_API_KEY) throw new Error('GEMINI_API_KEY environment variable not set');
 
+    // Scale the token budget with the parameter count so a large scorecard
+    // (many params + per-param reasons + summary + coaching tips) can't
+    // silently truncate mid-JSON. Base covers summary/coaching/confidence;
+    // ~120 tokens per parameter covers its score + a short reason.
+    const paramCount = NCK.length + CRK.length;
+    const dynamicMaxTokens = Math.min(8192, Math.max(2048, 1200 + paramCount * 120));
+
     // Current production Gemini Flash model. Google currently lists Gemini 3.6 Flash as GA.
-    const geminiRes = await fetch(
-      `https://generativelanguage.googleapis.com/v1beta/models/gemini-3.6-flash:generateContent?key=${GEMINI_API_KEY}`,
-      {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          contents: [{ parts: [{ text: SCORECARD_PROMPT + '\n\nCALL TRANSCRIPT:\n' + transcript }] }],
-          generationConfig: {
-            maxOutputTokens: 4096,
-            responseMimeType: 'application/json',
-          },
-        }),
+    const geminiData = await withRetry(async () => {
+      const geminiRes = await fetch(
+        `https://generativelanguage.googleapis.com/v1beta/models/gemini-3.6-flash:generateContent?key=${GEMINI_API_KEY}`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            contents: [{ parts: [{ text: SCORECARD_PROMPT + '\n\nCALL TRANSCRIPT:\n' + transcript }] }],
+            generationConfig: {
+              maxOutputTokens: dynamicMaxTokens,
+              responseMimeType: 'application/json',
+            },
+          }),
+        }
+      );
+      if (!geminiRes.ok) {
+        const errText = await geminiRes.text();
+        throw new Error(`Gemini API ${geminiRes.status}: ${errText}`);
       }
-    );
-
-    if (!geminiRes.ok) {
-      const errText = await geminiRes.text();
-      throw new Error(`Gemini API ${geminiRes.status}: ${errText}`);
-    }
-
-    const geminiData = await geminiRes.json();
+      return geminiRes.json();
+    }, { retries: 2, baseDelayMs: 1500, label: 'Gemini scoring' });
     const finishReason = geminiData.candidates?.[0]?.finishReason;
     const rawText = geminiData.candidates?.[0]?.content?.parts?.[0]?.text || '';
     if (!rawText) throw new Error('Gemini returned empty response');
@@ -218,6 +226,9 @@ module.exports = async (req, res) => {
   } catch (error) {
     console.error('AI scoring error:', error);
     await callRef.update({ status: 'ai_scoring_failed', error: error.message }).catch(() => {});
+    await sendFailureAlert({
+      stage: 'ai_scoring', callKey, processId, errorMessage: error.message,
+    }).catch(() => {});
     return res.status(500).json({ error: error.message });
   }
 };
