@@ -13,7 +13,17 @@
  * ADMIN_ALERT_EMAIL aren't set — never throws, never blocks the caller.
  */
 
-async function withRetry(fn, { retries = 2, baseDelayMs = 1000, label = 'operation' } = {}) {
+// Pulls a suggested wait time out of a 429 rate-limit error, if the API
+// told us one. Handles Gemini's plain-text "Please retry in 23.9s" style
+// as well as a numeric retryAfterMs already attached to the error object.
+function getSuggestedDelayMs(error) {
+  if (error && typeof error.retryAfterMs === 'number') return error.retryAfterMs;
+  const match = (error && error.message || '').match(/retry in ([\d.]+)\s*s/i);
+  if (match) return Math.ceil(parseFloat(match[1]) * 1000);
+  return null;
+}
+
+async function withRetry(fn, { retries = 2, baseDelayMs = 1000, maxDelayMs = 30000, label = 'operation' } = {}) {
   let lastError;
   for (let attempt = 0; attempt <= retries; attempt++) {
     try {
@@ -21,9 +31,13 @@ async function withRetry(fn, { retries = 2, baseDelayMs = 1000, label = 'operati
     } catch (e) {
       lastError = e;
       const isLastAttempt = attempt === retries;
-      console.warn(`${label} failed (attempt ${attempt + 1}/${retries + 1}): ${e.message}${isLastAttempt ? ' — giving up' : ' — retrying'}`);
+      const isRateLimit = e && (e.status === 429 || /\b429\b/.test(e.message || ''));
+      const suggested = isRateLimit ? getSuggestedDelayMs(e) : null;
+      const delay = suggested != null
+        ? Math.min(suggested + 500, maxDelayMs) // small buffer past what the API asked for
+        : baseDelayMs * Math.pow(2, attempt);     // default exponential backoff: 1s, 2s, 4s...
+      console.warn(`${label} failed (attempt ${attempt + 1}/${retries + 1}): ${e.message}${isLastAttempt ? ' — giving up' : ` — retrying in ${delay}ms${isRateLimit ? ' (rate limited)' : ''}`}`);
       if (isLastAttempt) break;
-      const delay = baseDelayMs * Math.pow(2, attempt); // 1s, 2s, 4s...
       await new Promise(r => setTimeout(r, delay));
     }
   }
@@ -75,4 +89,34 @@ function escapeHtml(s) {
   return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
 
-module.exports = { withRetry, sendFailureAlert };
+/**
+ * waitForGeminiSlot(): a free-tier-friendly traffic light for the Gemini
+ * API. Serverless invocations don't share memory, so instead of an
+ * in-process rate limiter, each call atomically claims the next
+ * available time slot in Firebase (via a transaction) and waits until
+ * its turn. This spaces out concurrent calls — e.g. an 8-call upload
+ * burst — so they hit Gemini one at a time, roughly minIntervalMs apart,
+ * instead of all at once tripping a per-minute quota.
+ *
+ * This smooths out normal bursts; it is not a substitute for a paid
+ * quota if sustained volume genuinely exceeds what pacing can absorb
+ * within a single function's execution window.
+ */
+async function waitForGeminiSlot(db, { minIntervalMs = 3200, maxWaitMs = 45000 } = {}) {
+  const rateRef = db.ref('rateLimiter/geminiNextSlot');
+  const txResult = await rateRef.transaction(current => {
+    const now = Date.now();
+    const prevSlot = (typeof current === 'number') ? current : 0;
+    const base = Math.max(prevSlot, now);
+    return base + minIntervalMs;
+  });
+  const committedNextSlot = txResult.snapshot.val();
+  const mySlot = committedNextSlot - minIntervalMs;
+  const waitMs = Math.min(Math.max(0, mySlot - Date.now()), maxWaitMs);
+  if (waitMs > 0) {
+    console.warn(`waitForGeminiSlot: pacing — waiting ${waitMs}ms before calling Gemini`);
+    await new Promise(r => setTimeout(r, waitMs));
+  }
+}
+
+module.exports = { withRetry, sendFailureAlert, waitForGeminiSlot };
