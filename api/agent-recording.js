@@ -15,6 +15,7 @@ function getDb() {
 }
 
 async function requireUser(req) {
+  getDb();
   const header = req.headers.authorization || '';
   if (!header.startsWith('Bearer ')) throw Object.assign(new Error('Missing authentication token'), { status: 401 });
   return admin.auth().verifyIdToken(header.slice(7).trim());
@@ -36,25 +37,6 @@ async function findAgent(db, processId, email) {
   return null;
 }
 
-async function smartfloToken() {
-  const email = process.env.SMARTFLO_EMAIL;
-  const password = process.env.SMARTFLO_PASSWORD;
-  if (!email || !password) return null;
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 10000);
-  try {
-    const res = await fetch('https://api-smartflo.tatateleservices.com/v1/auth/login', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
-      body: JSON.stringify({ email, password }),
-      signal: controller.signal,
-    });
-    if (!res.ok) throw new Error(`Smartflo authentication failed (${res.status})`);
-    const data = await res.json();
-    return data.access_token || null;
-  } finally { clearTimeout(timer); }
-}
-
 module.exports = async (req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Headers', 'Authorization, Content-Type');
@@ -72,13 +54,48 @@ module.exports = async (req, res) => {
     const agent = await findAgent(db, processId, decoded.email);
     if (!agent) return res.status(403).json({ error: 'Agent is not assigned to this process' });
 
-    const callSnap = await db.ref(`processes/${processId}/calls/${callKey}`).once('value');
+    const [callSnap, auditsSnap] = await Promise.all([
+      db.ref(`processes/${processId}/calls/${callKey}`).once('value'),
+      db.ref(`processes/${processId}/audits`).once('value'),
+    ]);
     if (!callSnap.exists()) return res.status(404).json({ error: 'Call not found' });
     const call = callSnap.val();
     if (!ownsCall(call, agent)) return res.status(403).json({ error: 'You can only play your own calls' });
     if (!call.recordingUrl) return res.status(404).json({ error: 'Recording not available' });
 
-    const token = await smartfloToken();
+    // A recording can only be played from an audit that belongs to this agent.
+    let linkedOwnAudit = false;
+    if (auditsSnap.exists()) {
+      for (const audit of Object.values(auditsSnap.val())) {
+        const sameCall = String(audit.callKey || '') === callKey || String(audit.callId || '') === String(call.callId || '');
+        const ownAudit = (audit.agentEmail && norm(audit.agentEmail) === norm(agent.email)) ||
+          (audit.empId && agent.empId && norm(audit.empId) === norm(agent.empId)) ||
+          norm(audit.agent) === norm(agent.name);
+        if (sameCall && ownAudit) { linkedOwnAudit = true; break; }
+      }
+    }
+    if (!linkedOwnAudit) return res.status(403).json({ error: 'Recording is not linked to one of your audited calls' });
+
+    let token = null;
+    const sfEmail = process.env.SMARTFLO_EMAIL;
+    const sfPassword = process.env.SMARTFLO_PASSWORD;
+    if (sfEmail && sfPassword) {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 10000);
+      try {
+        const authRes = await fetch('https://api-smartflo.tatateleservices.com/v1/auth/login', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+          body: JSON.stringify({ email: sfEmail, password: sfPassword }),
+          signal: controller.signal,
+        });
+        if (authRes.ok) {
+          const data = await authRes.json();
+          token = data.access_token || null;
+        }
+      } finally { clearTimeout(timer); }
+    }
+
     const headers = { Accept: 'audio/*,application/octet-stream,*/*', 'User-Agent': 'QA.Hub-Agent/1.0' };
     if (token) headers.Authorization = `Bearer ${token}`;
     if (req.headers.range) headers.Range = req.headers.range;
