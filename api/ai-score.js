@@ -1,5 +1,5 @@
 const admin = require('firebase-admin');
-const { withRetry, sendFailureAlert } = require('./_lib/reliability');
+const { withRetry, sendFailureAlert, waitForGeminiSlot } = require('./_lib/reliability');
 
 /**
  * QA.Hub — AI Scoring via Google Gemini Flash
@@ -158,6 +158,11 @@ module.exports = async (req, res) => {
     const paramCount = NCK.length + CRK.length;
     const dynamicMaxTokens = Math.min(8192, Math.max(2048, 1200 + paramCount * 120));
 
+    // Free-tier pacing: claim a spaced-out slot before calling Gemini so a
+    // burst of calls (e.g. several uploaded at once) doesn't all hit the
+    // API in the same second and trip the per-minute quota.
+    await waitForGeminiSlot(db, { minIntervalMs: 3200 });
+
     // Current production Gemini Flash model. Google currently lists Gemini 3.6 Flash as GA.
     const geminiData = await withRetry(async () => {
       const geminiRes = await fetch(
@@ -176,10 +181,12 @@ module.exports = async (req, res) => {
       );
       if (!geminiRes.ok) {
         const errText = await geminiRes.text();
-        throw new Error(`Gemini API ${geminiRes.status}: ${errText}`);
+        const err = new Error(`Gemini API ${geminiRes.status}: ${errText}`);
+        err.status = geminiRes.status;
+        throw err;
       }
       return geminiRes.json();
-    }, { retries: 2, baseDelayMs: 1500, label: 'Gemini scoring' });
+    }, { retries: 1, baseDelayMs: 1500, maxDelayMs: 35000, label: 'Gemini scoring' });
     const finishReason = geminiData.candidates?.[0]?.finishReason;
     const rawText = geminiData.candidates?.[0]?.content?.parts?.[0]?.text || '';
     if (!rawText) throw new Error('Gemini returned empty response');
