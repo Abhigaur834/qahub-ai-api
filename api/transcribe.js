@@ -1,4 +1,5 @@
 const admin = require('firebase-admin');
+const { withRetry, sendFailureAlert } = require('./_lib/reliability');
 
 function getDb() {
   if (!admin.apps.length) {
@@ -162,8 +163,14 @@ module.exports = async (req, res) => {
 
   try {
     await callRef.update({ status: 'transcribing', error: null });
-    const { audioBuffer, mime } = await downloadRecording(recordingUrl);
-    const dgData = await transcribeWithDeepgram({ audioBuffer, mime, recordingUrl, lang });
+    const { audioBuffer, mime } = await withRetry(
+      () => downloadRecording(recordingUrl),
+      { retries: 2, baseDelayMs: 1500, label: 'Recording download' }
+    );
+    const dgData = await withRetry(
+      () => transcribeWithDeepgram({ audioBuffer, mime, recordingUrl, lang }),
+      { retries: 1, baseDelayMs: 2000, label: 'Deepgram transcription' }
+    );
     const utterances = dgData.results?.utterances || [];
     if (!utterances.length) throw new Error('Deepgram returned no utterances — recording may be silent, empty, or unsupported');
 
@@ -222,6 +229,9 @@ module.exports = async (req, res) => {
   } catch (error) {
     console.error('Transcription error:', error);
     await callRef.update({ status: 'transcription_failed', error: error.message }).catch(() => {});
+    await sendFailureAlert({
+      stage: 'transcription', callKey, processId, errorMessage: error.message,
+    }).catch(() => {});
     return res.status(500).json({ error: error.message });
   }
 };
