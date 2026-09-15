@@ -93,7 +93,17 @@ module.exports = async (req, res) => {
       toDate,
       agentName,
       callType,
+      minDuration,
+      maxDuration,
     } = req.body || {};
+
+    // Duration bounds in seconds. Filtering here (rather than after import)
+    // is what actually saves money: a call that never gets imported never
+    // gets sent to Deepgram for transcription or Gemini for scoring. Very
+    // short "connected" calls are usually dial-tone/no-answer artifacts with
+    // no speech in them at all — transcribing those is pure waste.
+    const minDurSec = Number.isFinite(Number(minDuration)) && Number(minDuration) > 0 ? Number(minDuration) : 0;
+    const maxDurSec = Number.isFinite(Number(maxDuration)) && Number(maxDuration) > 0 ? Number(maxDuration) : Infinity;
 
     const now = new Date();
     const startOfToday = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 0, 0, 0);
@@ -137,6 +147,14 @@ module.exports = async (req, res) => {
       const isConnected = !!(r.recording_url && Number(r.call_duration) > 0);
       const connectedOk = mode === 'connected' ? isConnected : mode === 'not_connected' ? !isConnected : true;
       if (!connectedOk) return false;
+      // Only apply duration bounds to calls that actually have a duration —
+      // a not-connected call legitimately has 0/undefined and shouldn't be
+      // filtered out by a minimum meant for real conversations.
+      if (minDurSec > 0 || maxDurSec < Infinity) {
+        const dur = Number(r.call_duration) || 0;
+        if (dur > 0 && (dur < minDurSec || dur > maxDurSec)) return false;
+        if (dur === 0 && minDurSec > 0 && mode !== 'not_connected') return false;
+      }
       if (agentName) return (r.agent_name || '').toLowerCase().includes(agentName.toLowerCase());
       return true;
     }
